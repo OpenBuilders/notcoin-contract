@@ -1,16 +1,18 @@
+import { checkJettonMinter } from '../wrappers/JettonMinterChecker';
 import { Address, beginCell, Cell, fromNano, OpenedContract, toNano } from '@ton/core';
 import { compile, NetworkProvider, UIProvider} from '@ton/blueprint';
 import { JettonMinter, jettonMinterConfigCellToConfig, JettonMinterConfigFull, jettonMinterConfigFullToCell } from '../wrappers/JettonMinter';
-import { promptBool, promptAmount, promptAddress, displayContentCell, getLastBlock, waitForTransaction, getAccountLastTx } from '../wrappers/ui-utils';
-import { JettonWallet } from '../wrappers/JettonWallet';
+import { promptBool, promptAmount, promptAddress, displayContentCell, getLastBlock, waitForTransaction, getAccountLastTx, promptToncoin, promptUrl, jettonWalletCodeFromLibrary } from '../wrappers/ui-utils';
 import {TonClient4} from "@ton/ton";
-let minterContract:OpenedContract<JettonMinter>;
+import { fromUnits } from '../wrappers/units';
+let jettonMinterContract:OpenedContract<JettonMinter>;
 
-const adminActions  = ['Mint', 'Change admin', 'Drop admin', 'Upgrade' ];
-const userActions   = ['Info', 'Claim admin', 'Quit'];
+const adminActions  = ['Mint', 'Change admin', 'Drop admin', 'Change metadata', 'Upgrade' ];
+const userActions   = ['Info', 'Top up', 'Claim admin', 'Quit'];
 let minterCode: Cell;
 let walletCode: Cell;
-
+let adminAddress: Address | null;
+let decimals: number;
 
 
 const failedTransMessage = (ui:UIProvider) => {
@@ -19,7 +21,7 @@ const failedTransMessage = (ui:UIProvider) => {
 };
 
 const infoAction = async (provider:NetworkProvider, ui:UIProvider) => {
-    const jettonData = await minterContract.getJettonData();
+    const jettonData = await jettonMinterContract.getJettonData();
     ui.write("Jetton info:\n\n");
     ui.write(`Admin:${jettonData.adminAddress}\n`);
     ui.write(`Total supply:${fromNano(jettonData.totalSupply)}\n`);
@@ -29,10 +31,34 @@ const infoAction = async (provider:NetworkProvider, ui:UIProvider) => {
         await displayContentCell(jettonData.content, ui);
     }
 };
+const topUpAction = async (provider: NetworkProvider, ui: UIProvider) => {
+    const topUpAmount = await promptToncoin("How much would you like to top up:", ui);
+    if(!await promptBool(`Send ${fromNano(topUpAmount)} ton to minter?`, ['yes', 'no'], ui)){
+        ui.write('Top up aborted!');
+        return;
+    }
+    ui.write(`Sending ${fromNano(topUpAmount)} to minter`);
+    await jettonMinterContract.sendTopUp(provider.sender(), topUpAmount);
+}
+const updateMetadataAction = async (provider: NetworkProvider, ui: UIProvider) => {
+       const jettonMetadataUri = await promptUrl("Enter jetton metadata uri (https://jettonowner.com/jetton.json)", ui)
+
+        if (!(await promptBool(`Change metadata url to "${jettonMetadataUri}"?`, ['yes', 'no'], ui))) {
+            ui.write('Update metadata aborted!');
+            return;
+        }
+
+        await jettonMinterContract.sendChangeContent(provider.sender(), {
+            uri: jettonMetadataUri
+        });
+
+        ui.write('Transaction sent');
+
+}
 const changeAdminAction = async(provider:NetworkProvider, ui:UIProvider) => {
     let retry:boolean;
     let newAdmin:Address;
-    let curAdmin = await minterContract.getAdminAddress();
+    let curAdmin = await jettonMinterContract.getAdminAddress();
     if(curAdmin == null) {
         throw new Error("Current admin address is addr_none. No way to change it");
     }
@@ -49,11 +75,11 @@ const changeAdminAction = async(provider:NetworkProvider, ui:UIProvider) => {
         }
     } while(retry);
 
-    const lastTx   = await getAccountLastTx(provider, minterContract.address);
+    const lastTx   = await getAccountLastTx(provider, jettonMinterContract.address);
 
-    await minterContract.sendChangeAdmin(provider.sender(), newAdmin);
+    await jettonMinterContract.sendChangeAdmin(provider.sender(), newAdmin);
     const transDone = await waitForTransaction(provider,
-                                               minterContract.address,
+                                               jettonMinterContract.address,
                                                lastTx,
                                                10);
     if(transDone) {
@@ -65,7 +91,7 @@ const changeAdminAction = async(provider:NetworkProvider, ui:UIProvider) => {
 };
 
 const dropAdminAction = async (provider: NetworkProvider, ui: UIProvider) => {
-    let curAdmin = await minterContract.getAdminAddress();
+    let curAdmin = await jettonMinterContract.getAdminAddress();
     let retry : boolean;
 
     if(curAdmin == null) {
@@ -77,7 +103,7 @@ const dropAdminAction = async (provider: NetworkProvider, ui: UIProvider) => {
     const sure = await promptBool('Are you absolutely sure, you want to drop admin?', ['yes', 'no'], ui);
 
     if(sure) {
-        await minterContract.sendDropAdmin(provider.sender());
+        await jettonMinterContract.sendDropAdmin(provider.sender());
     }
     else {
         ui.write('Operation abort');
@@ -85,21 +111,21 @@ const dropAdminAction = async (provider: NetworkProvider, ui: UIProvider) => {
 }
 
 const claimAdminAction = async (provider: NetworkProvider, ui: UIProvider) => {
-    const prevAdmin = await minterContract.getAdminAddress();
+    const prevAdmin = await jettonMinterContract.getAdminAddress();
     if(prevAdmin == null) {
         throw new Error("Current admin address is addr_none. No way to change it");
     }
 
-    const lastTx   = await getAccountLastTx(provider, minterContract.address);
+    const lastTx   = await getAccountLastTx(provider, jettonMinterContract.address);
 
-    await minterContract.sendClaimAdmin(provider.sender());
+    await jettonMinterContract.sendClaimAdmin(provider.sender());
 
     const transDone = await waitForTransaction(provider,
-                                               minterContract.address,
+                                               jettonMinterContract.address,
                                                lastTx,
                                                10);
     if(transDone) {
-        const newAdmin = await minterContract.getAdminAddress()!;
+        const newAdmin = await jettonMinterContract.getAdminAddress()!;
         if(newAdmin == null || newAdmin.equals(prevAdmin)) {
             ui.write("Something went wrong!\nAdmin address didn't change");
         }
@@ -116,34 +142,33 @@ const mintAction = async (provider:NetworkProvider, ui:UIProvider) => {
     const sender = provider.sender();
     let retry:boolean;
     let mintAddress:Address;
-    let mintAmount:string;
+    let mintAmount: bigint;
 
     do {
         retry = false;
-        const fallbackAddr = sender.address ?? (await minterContract.getAdminAddress() || undefined);
+        const fallbackAddr = sender.address ?? (await jettonMinterContract.getAdminAddress() || undefined);
         mintAddress = await promptAddress(`Please specify address to mint to`, ui, fallbackAddr);
-        mintAmount  = await promptAmount('Please provide mint amount in decimal form:', ui);
-        ui.write(`Mint ${mintAmount} tokens to ${mintAddress}\n`);
+        mintAmount  = await promptAmount('Please provide mint amount in decimal form:', decimals, ui);
+        ui.write(`Mint ${fromUnits(mintAmount, decimals)} tokens to ${mintAddress}\n`);
         retry = !(await promptBool('Is it ok?', ['yes', 'no'], ui));
     } while(retry);
 
-    ui.write(`Minting ${mintAmount} to ${mintAddress}\n`);
-    const supplyBefore = await minterContract.getTotalSupply();
-    const nanoMint     = toNano(mintAmount);
-    const lastTx       = await getAccountLastTx(provider, minterContract.address);
+    ui.write(`Minting ${fromUnits(mintAmount, decimals)} to ${mintAddress}\n`);
+    const supplyBefore = await jettonMinterContract.getTotalSupply();
+    const lastTx       = await getAccountLastTx(provider, jettonMinterContract.address);
 
-    await minterContract.sendMint(sender,
+    await jettonMinterContract.sendMint(sender,
                                   mintAddress,
-                                  nanoMint);
+                                  mintAmount);
     const gotTrans = await waitForTransaction(provider,
-                                              minterContract.address,
+                                              jettonMinterContract.address,
                                               lastTx,
                                               10);
     if(gotTrans) {
-        const supplyAfter = await minterContract.getTotalSupply();
+        const supplyAfter = await jettonMinterContract.getTotalSupply();
 
-        if(supplyAfter == supplyBefore + nanoMint) {
-            ui.write("Mint successfull!\nCurrent supply:" + fromNano(supplyAfter));
+        if(supplyAfter == supplyBefore + mintAmount) {
+            ui.write("Mint successfull!\nCurrent supply:" + fromUnits(supplyAfter, decimals));
         }
         else {
             ui.write("Mint failed!");
@@ -163,7 +188,7 @@ const updateData = async (oldData: Cell, ui: UIProvider) => {
         let   updateWallet = false;
         const updateSupply = await promptBool(`Current supply:${fromNano(curConfig.supply)}\nWant to change?`, ['Yes', 'No'], ui, true);
         if(updateSupply)
-            newConfig.supply   = toNano(await promptAmount('Enter new supply amount:', ui));
+            newConfig.supply   = await promptAmount('Enter new supply amount:', decimals, ui);
         const updateAdmin  = await promptBool(`Current admin:${curConfig.admin}\nWant to change?`, ['Yes', 'No'], ui, true);
         if(updateAdmin)
             newConfig.admin = await promptAddress('Enter new admin address:', ui);
@@ -183,7 +208,7 @@ const updateData = async (oldData: Cell, ui: UIProvider) => {
         }
         retry = !(await promptBool(`New config:${JSON.stringify({
             supply: newConfig.supply.toString(),
-            admin: newConfig.admin.toString(),
+            admin: newConfig.admin?.toString(),
             transfer_admin: newConfig.transfer_admin?.toString(),
             wallet_code: updateWallet ? "updated" : "preserved"
         }, null, 2)}\nIs it okay?`, ['Yes', 'No'], ui));
@@ -195,7 +220,7 @@ const upgradeAction = async (provider: NetworkProvider, ui: UIProvider) => {
     let upgradeCode = await promptBool(`Would you like to upgrade code?\nSource from jetton-minter.fc will be used.`, ['Yes', 'No'], ui, true);
     let upgradeData = await promptBool(`Would you like to upgrade data?`, ['Yes', 'No'], ui, true);
 
-    const contractState = await api.getAccount(await getLastBlock(provider), minterContract.address);
+    const contractState = await api.getAccount(await getLastBlock(provider), jettonMinterContract.address);
 
     if(contractState.account.state.type !== 'active')
         throw(Error("Upgrade is only possible for active contract"));
@@ -207,9 +232,9 @@ const upgradeAction = async (provider: NetworkProvider, ui: UIProvider) => {
     if(upgradeCode || upgradeData) {
         const newCode = upgradeCode ? minterCode : Cell.fromBase64(contractState.account.state.code);
         const newData = upgradeData ? await updateData(dataBefore, ui) : dataBefore;
-        await minterContract.sendUpgrade(provider.sender(), newCode, newData, toNano('0.05'));
+        await jettonMinterContract.sendUpgrade(provider.sender(), newCode, newData, toNano('0.05'));
         const gotTrans = await waitForTransaction(provider,
-                                                  minterContract.address,
+                                                  jettonMinterContract.address,
                                                   contractState.account.last!.lt,
                                                   10);
         if(gotTrans){
@@ -253,9 +278,8 @@ export async function run(provider: NetworkProvider) {
     const ui = provider.ui();
     const sender = provider.sender();
     const hasSender = sender.address !== undefined;
-    const api    = provider.api() as TonClient4;
     minterCode = await compile('JettonMinter');
-    walletCode = await compile('JettonWallet');
+    walletCode = jettonWalletCodeFromLibrary(await compile('JettonWallet'));
     let   done   = false;
     let   retry:boolean;
     let   minterAddress:Address;
@@ -263,24 +287,31 @@ export async function run(provider: NetworkProvider) {
     do {
         retry = false;
         minterAddress = await promptAddress('Please enter minter address:', ui);
-        const contractState = await api.getAccount(await getLastBlock(provider), minterAddress);
-        if(contractState.account.state.type !== "active" || contractState.account.state.code == null) {
-            retry = true;
-            ui.write("This contract is not active!\nPlease use another address, or deploy it first");
+        try {
+            const verifyRes = await checkJettonMinter({isBounceable: true, isTestOnly: false, address: minterAddress},
+                                                      minterCode, walletCode, provider, ui, provider.network() == 'testnet', true); 
+            jettonMinterContract = verifyRes.jettonMinterContract;
+            adminAddress = verifyRes.adminAddress;
+            decimals     = verifyRes.decimals;
         }
-        else {
-            const stateCode = Cell.fromBase64(contractState.account.state.code);
-            if(!stateCode.equals(minterCode)) {
-                ui.write("Contract code differs from the current contract version!\n");
-                const resp = await ui.choose("Use address anyway", ["Yes", "No"], (c: string) => c);
-                retry = resp == "No";
+        catch(e) {
+            ui.write(`Doesn't look like minter:${e}`);
+            if(!(await promptBool("Are you sure it is the one", ['Yes', 'No'], ui, true))) {
+                return;
             }
+
+            jettonMinterContract = provider.open(
+                JettonMinter.createFromAddress(minterAddress)
+            );
+            adminAddress = await jettonMinterContract.getAdminAddress();
+            ui.write("Ok, boss!");
+            decimals = Number(
+                await promptAmount("Please specify contract decimals:", 0, ui)
+            );
         }
     } while(retry);
 
-    minterContract = provider.open(JettonMinter.createFromAddress(minterAddress));
-    const curAdmin = await minterContract.getAdminAddress();
-    const isAdmin  = hasSender ? (curAdmin == null ? false : curAdmin.equals(sender.address)) : true;
+    const isAdmin  = hasSender ? (adminAddress == null ? false : adminAddress.equals(sender.address)) : true;
     let actionList:string[];
     if(isAdmin) {
         actionList = [...adminActions, ...userActions];
@@ -301,6 +332,9 @@ export async function run(provider: NetworkProvider) {
             case 'Change admin':
                 await changeAdminAction(provider, ui);
                 break;
+            case 'Change metadata':
+                await updateMetadataAction(provider, ui);
+                break;
             case 'Claim admin':
                 await claimAdminAction(provider, ui);
                 break;
@@ -312,6 +346,9 @@ export async function run(provider: NetworkProvider) {
                 break;
             case 'Info':
                 await infoAction(provider, ui);
+                break;
+            case 'Top up':
+                await topUpAction(provider, ui);
                 break;
             case 'Quit':
                 done = true;
